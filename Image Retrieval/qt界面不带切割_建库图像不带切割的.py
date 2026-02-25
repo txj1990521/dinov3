@@ -16,12 +16,13 @@ from PyQt5.QtWidgets import (
 )
 
 from dinov3.models.vision_transformer import vit_large
+import torch.nn.functional as F
 
 # =========================
 # CONFIG
 # =========================
-CKPT = r"D:/zhanlanProject/dinov3/pre_model/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
-OUT_DIR = r"D:\zhanlan\faiss_dinov3_noCrop"
+CKPT = r"D:/zhanlanProject/dinov3/pre_model/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+OUT_DIR = r"D:\zhanlan\faiss_dinov3_L_noCrop"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 GLOBAL_INDEX = os.path.join(OUT_DIR, "global.index")
@@ -29,87 +30,69 @@ GLOBAL_META  = os.path.join(OUT_DIR, "global_img_paths.npy")
 
 DEFAULT_TOPK = 12
 DEFAULT_COLS = 4
-
+IMAGE_SIZE=1024
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 
 
 # =========================
 # Core (same as your logic)
 # =========================
-def build_dinov3_vitl16(ckpt_path: str, device: str):
-    model = vit_large(patch_size=16)
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
-    if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
-        sd = ckpt["model"]
-    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-        sd = ckpt["state_dict"]
-    elif isinstance(ckpt, dict):
-        sd = ckpt
-    else:
-        raise ValueError("Unsupported checkpoint format")
+
+def build_model():
+    model = vit_large(patch_size=16)
+
+    state_dict = torch.load(CKPT, map_location="cpu", weights_only=True)
 
     cleaned = {}
-    for k, v in sd.items():
-        kk = k
+    for k, v in state_dict.items():
         for pref in ("module.", "model.", "backbone."):
-            if kk.startswith(pref):
-                kk = kk[len(pref):]
-        cleaned[kk] = v
+            if k.startswith(pref):
+                k = k[len(pref):]
+        cleaned[k] = v
 
-    missing, unexpected = model.load_state_dict(cleaned, strict=False)
-    print(f"[MODEL] loaded. missing={len(missing)} unexpected={len(unexpected)}")
+    model.load_state_dict(cleaned, strict=False)
+    model.eval().to(DEVICE)
 
-    model.eval().to(device)
     return model
 
+def gem_pool(x, p=3.0, eps=1e-6):
+    return (x.clamp(min=eps).pow(p).mean(dim=1)).pow(1.0 / p)
+
+def preprocess(img_bgr):
+    if img_bgr is None:
+        return None
+
+    # 强制 3 通道
+    if img_bgr.ndim == 2:
+        img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
+    elif img_bgr.shape[2] == 4:
+        img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2BGR)
+
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    h, w = img.shape[:2]
+    scale = 224 / min(h, w)
+    nh, nw = int(round(h * scale)), int(round(w * scale))
+    img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_CUBIC)
+
+    y0 = max(0, (nh - 224) // 2)
+    x0 = max(0, (nw - 224) // 2)
+    img = img[y0:y0+224, x0:x0+224]
+    # 兜底：保证一定是 224x224
+    if img.shape[0] != 224 or img.shape[1] != 224:
+        img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_CUBIC)
+    img = img.astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img = (img - mean) / std
+    img = np.transpose(img, (2,0,1)).astype(np.float32)
+
+    return torch.from_numpy(img)
 
 def imread_unicode(p):
     data = np.fromfile(p, dtype=np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
-
-
-def preprocess(img_bgr):
-    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (224, 224))
-    img = img.astype(np.float32) / 255.0
-    img = (img - 0.5) / 0.5
-    img = np.transpose(img, (2, 0, 1))
-    return torch.from_numpy(img)
-
-
-@torch.no_grad()
-def extract_embedding(model, img_tensor):
-    feats = model.forward_features(img_tensor)
-
-    if isinstance(feats, dict):
-        for k in ["x_norm_clstoken", "cls_token", "clstoken", "x_cls", "feat_cls"]:
-            if k in feats and torch.is_tensor(feats[k]):
-                cls = feats[k]
-                return F.normalize(cls, dim=1)
-
-        for k in ["x_norm", "tokens", "x", "last_hidden_state", "x_prenorm"]:
-            if k in feats and torch.is_tensor(feats[k]):
-                tok = feats[k]
-                if tok.dim() == 3:
-                    cls = tok[:, 0, :]
-                    return F.normalize(cls, dim=1)
-                if tok.dim() == 2:
-                    return F.normalize(tok, dim=1)
-
-        raise KeyError(f"forward_features returned dict but no known keys found. keys={list(feats.keys())}")
-
-    if torch.is_tensor(feats):
-        if feats.dim() == 3:
-            cls = feats[:, 0, :]
-        elif feats.dim() == 2:
-            cls = feats
-        else:
-            raise ValueError(f"Unexpected feats tensor shape: {feats.shape}")
-        return F.normalize(cls, dim=1)
-
-    raise TypeError(f"Unexpected forward_features type: {type(feats)}")
-
 
 def load_faiss(index_path, meta_path):
     if not os.path.exists(index_path):
@@ -122,21 +105,28 @@ def load_faiss(index_path, meta_path):
     return index, img_paths
 
 
+@torch.no_grad()
 def search_one(model, index, img_paths, query_img_path, topk=10):
     img = imread_unicode(query_img_path)
     if img is None:
         raise ValueError(f"Cannot read query image: {query_img_path}")
 
-    q = preprocess(img).unsqueeze(0).to(DEVICE)
-    q_feat = extract_embedding(model, q).cpu().numpy().astype("float32")
+    tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+
+    feats = model.forward_features(tensor)
+
+    # 和你“CLS建库”一致：CLS + L2 normalize
+    emb = feats["x_norm_clstoken"]
+    emb = F.normalize(emb, dim=1)
+
+    q_feat = emb.cpu().numpy().astype("float32")
 
     scores, ids = index.search(q_feat, topk)
 
     results = []
     for rank, (idx, score) in enumerate(zip(ids[0], scores[0]), start=1):
-        if idx < 0:
-            continue
-        results.append((rank, float(score), str(img_paths[idx])))
+        if idx >= 0:
+            results.append((rank, float(score), str(img_paths[idx])))
     return results
 
 
@@ -371,9 +361,8 @@ class MainWindow(QMainWindow):
             self.status_line.setText("Loading FAISS index...")
             self.index, self.img_paths = load_faiss(GLOBAL_INDEX, GLOBAL_META)
             self.status_line.setText(f"Index loaded. ntotal={self.index.ntotal}")
-
+            self.model = build_model()
             self.status_line.setText("Loading model...")
-            self.model = build_dinov3_vitl16(CKPT, DEVICE)
             self.status_line.setText(f"Model loaded on {DEVICE}. Ready.")
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))

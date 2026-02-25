@@ -20,8 +20,8 @@ from dinov3.models.vision_transformer import vit_large
 # =========================
 # CONFIG
 # =========================
-CKPT = r"D:/zhanlanProject/dinov3/pre_model/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
-OUT_DIR = r"D:\zhanlan\faiss_dinov3"
+CKPT = r"D:/zhanlanProject/dinov3/pre_model/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+OUT_DIR = r"D:\zhanlan\faiss_database_dinov3_hybrid"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 GLOBAL_INDEX = os.path.join(OUT_DIR, "global.index")

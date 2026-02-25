@@ -10,14 +10,14 @@ import numpy as np
 # =========================
 # CONFIG
 # =========================
-CKPT = r"pre_model/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
-OUT_DIR = r"D:\zhanlan\faiss_dinov3"
-
+CKPT = r"D:/zhanlanProject/dinov3/pre_model/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+# OUT_DIR = r"D:\zhanlan\faiss_dinov3"
+OUT_DIR = r"D:\zhanlan\faiss_dinov3_L_noCrop"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 GLOBAL_INDEX = os.path.join(OUT_DIR, "global.index")
 GLOBAL_META  = os.path.join(OUT_DIR, "global_img_paths.npy")
-
+IMAGE_SIZE=1024
 
 # 你要搜的图片（可改成自己的路径）
 QUERY_IMG = r"D:\zhanlan\qurrey_data\333.jpg"
@@ -59,49 +59,81 @@ def build_dinov3_vitl16(ckpt_path: str, device: str):
 # =========================
 # Utils
 # =========================
+def extract_multiscale(model, img_bgr):
+    feats_all = []
+
+    for size in [768, 1024]:
+        global IMAGE_SIZE
+        IMAGE_SIZE = size
+
+        q = preprocess(img_bgr).unsqueeze(0).to(DEVICE)
+        feat = extract_embedding(model, q)
+        feats_all.append(feat)
+
+    feat = torch.stack(feats_all).mean(dim=0)
+    return feat
+
 def imread_unicode(p):
     data = np.fromfile(p, dtype=np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 def preprocess(img_bgr):
     img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (224, 224))
+
+    h, w = img.shape[:2]
+    scale = IMAGE_SIZE / min(h, w)
+    nh, nw = int(h * scale), int(w * scale)
+    img = cv2.resize(img, (nw, nh))
+
+    # center crop
+    y0 = (nh - IMAGE_SIZE) // 2
+    x0 = (nw - IMAGE_SIZE) // 2
+    img = img[y0:y0+IMAGE_SIZE, x0:x0+IMAGE_SIZE]
+
     img = img.astype(np.float32) / 255.0
-    img = (img - 0.5) / 0.5
-    img = np.transpose(img, (2, 0, 1))
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    img = (img - mean) / std
+    img = np.transpose(img, (2,0,1))
+
     return torch.from_numpy(img)
+
+def gem_pool(x, p=3.0, eps=1e-6):
+    return (x.clamp(min=eps).pow(p).mean(dim=1)).pow(1.0/p)
 
 @torch.no_grad()
 def extract_embedding(model, img_tensor):
     feats = model.forward_features(img_tensor)
 
     if isinstance(feats, dict):
-        for k in ["x_norm_clstoken", "cls_token", "clstoken", "x_cls", "feat_cls"]:
-            if k in feats and torch.is_tensor(feats[k]):
-                cls = feats[k]
-                return F.normalize(cls, dim=1)
+        if "x_norm_patchtokens" in feats and torch.is_tensor(feats["x_norm_patchtokens"]):
+            emb = feats["x_norm_clstoken"]
+            return F.normalize(emb, dim=1)
 
         for k in ["x_norm", "tokens", "x", "last_hidden_state", "x_prenorm"]:
-            if k in feats and torch.is_tensor(feats[k]):
-                tok = feats[k]
-                if tok.dim() == 3:
-                    cls = tok[:, 0, :]
-                    return F.normalize(cls, dim=1)
-                if tok.dim() == 2:
-                    return F.normalize(tok, dim=1)
+            if k in feats and torch.is_tensor(feats[k]) and feats[k].dim() == 3:
+                tok = feats[k]                       # [B, T, C]
+                patch = tok[:, 1:, :]                # 去 CLS
+                emb = gem_pool(patch)
+                return F.normalize(emb, dim=1)
 
-        raise KeyError(f"forward_features returned dict but no known keys found. keys={list(feats.keys())}")
+        if "x_norm_clstoken" in feats and torch.is_tensor(feats["x_norm_clstoken"]):
+            return F.normalize(feats["x_norm_clstoken"], dim=1)
+
+        raise KeyError(list(feats.keys()))
 
     if torch.is_tensor(feats):
         if feats.dim() == 3:
-            cls = feats[:, 0, :]
-        elif feats.dim() == 2:
-            cls = feats
-        else:
-            raise ValueError(f"Unexpected feats tensor shape: {feats.shape}")
-        return F.normalize(cls, dim=1)
+            patch = feats[:, 1:, :]
+            emb = patch.mean(dim=1)
+            return F.normalize(emb, dim=1)
+        if feats.dim() == 2:
+            return F.normalize(feats, dim=1)
+        raise ValueError(feats.shape)
 
-    raise TypeError(f"Unexpected forward_features type: {type(feats)}")
+    raise TypeError(type(feats))
 
 def load_faiss(index_path, meta_path):
     if not os.path.exists(index_path):
@@ -122,7 +154,7 @@ def search_one(model, index, img_paths, query_img_path, topk=10):
         raise ValueError(f"Cannot read query image: {query_img_path}")
 
     q = preprocess(img).unsqueeze(0).to(DEVICE)  # [1,3,224,224]
-    q_feat = extract_embedding(model, q).cpu().numpy().astype("float32")  # [1,D]
+    q_feat = extract_multiscale(model, img).cpu().numpy().astype("float32")
 
     # IndexFlatIP: returns (scores, ids)
     scores, ids = index.search(q_feat, topk)

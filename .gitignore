@@ -17,3 +17,5 @@ dist/
 # Ignore vscode directory
 .vscode/
 *.pth
+*.db
+*.safetensors

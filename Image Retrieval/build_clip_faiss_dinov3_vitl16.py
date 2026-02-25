@@ -44,7 +44,7 @@ from tqdm import tqdm
 # =========================
 # CONFIG: 只改这里
 # =========================
-CKPT = r"pre_model/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+CKPT = r"D:/zhanlanProject/dinov3/pre_model/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
 DATA_ROOT = r"D:\zhanlan\new_data"
 OUT_DIR = r"D:\zhanlan\faiss_database_dinov3_hybrid"
 
